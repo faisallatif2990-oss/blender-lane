@@ -1,0 +1,200 @@
+# render-panos.yml — GitHub Actions PARALLEL render lane for the
+# plan -> 3D tour pipeline (our own code, Blender 5.3, CPU Cycles).
+#
+# WHY THIS LANE EXISTS
+#   The local VM renders one 360° pano in ~17 min (2048x1024/32) and
+#   ~59 min (3072x1536/64, the current sharp setting) — so a 6-room set
+#   is ~6 h and the full 13-node walk-in set is ~13 h, one by one.
+#   This workflow renders ONE pano per matrix job on separate
+#   ubuntu-latest runners, all at once: the wall time becomes the
+#   slowest single pano, not the sum.
+#
+# WHAT RUNS (thin executor only — owner's rule)
+#   Our own plan_to_render.py (from payload.zip) on the official
+#   Blender 5.3.0 tarball, with the exact tour settings the script
+#   itself carries (currently 3072x1536, 64 samples, adaptive 0.05,
+#   JPEG q90 — see plan_to_render.py, "SHARPNESS ORDER"). No
+#   third-party builder, tour maker or render service touches the work.
+#
+# PAYLOAD DELIVERY — GitHub Release asset (chosen, see README.md)
+#   payload.zip (~107 MB) cannot be committed to git (100 MB file
+#   limit) and actions/cache evicts after 7 idle days, so the payload
+#   ships as a release asset on the existing public repo
+#   faisallatif2990-oss/blender-lane, tag given by the `payload_tag`
+#   input (default payload-20261125). Public repo => runners download
+#   it with the built-in GITHUB_TOKEN; no extra token, no account.
+#   The released payload carries the GPU-patched script (Kaggle lane);
+#   this CPU lane restores the one `cy.device` line before rendering.
+#
+# RUNNER FACTS (GitHub docs, 2026-09-20 read)
+#   ubuntu-latest on a PUBLIC repo = 4 vCPU / 16 GB RAM / 14 GB SSD,
+#   free and unlimited minutes. On a PRIVATE repo the same label is
+#   2 vCPU / 8 GB and minutes come from the 2,000 min/month free
+#   allowance. blender-lane is public, so the 4-vCPU column applies.
+#   Free-plan concurrency is 20 jobs — a 13-node matrix fits.
+#
+# ESTIMATES (honest, from measured local baselines — first run calibrates)
+#   Local: 3072x1536/64 living = 59 min total at ~1.35 effective cores.
+#   Cycles CPU render scales ~linearly with cores, so per pano:
+#     4 vCPU (public repo, real case): ~20 min render + ~5 min
+#       setup/build  => ~25 min per job; 6 or 13 panos in parallel
+#       => ~25 min wall (vs ~6 h / ~13 h local, one by one).
+#     2 vCPU (private repo):           ~40 min render + ~5 min
+#       setup/build  => ~45 min per job; wall ~45 min either way.
+#   At 2048x1024/32 the same math gives ~6-7 min (4 vCPU) / ~12 min
+#   (2 vCPU) per pano. Per-pano times vary (balcony was fastest
+#   locally, living slowest) — the wall is the slowest single job.
+#
+# AFTER THE RUN
+#   Each pano lands as its own artifact (pano-<key>, 30-day retention).
+#   Pull them back with `gh run download` (see report job output and
+#   README.md), flatten into code-pipeline/tour/, and EYEBALL every
+#   pano flat before it counts as delivered — the standing QA rule.
+#   Actions cannot do the visual check; the facing gate below is only
+#   the cheap automatic part.
+#
+# DEPLOY (not done by this file — see README.md "Blockers"):
+#   1. `gh release create <tag> payload.zip --repo faisallatif2990-oss/blender-lane`
+#   2. Push this file to `.github/workflows/render-panos.yml` in that repo.
+#   3. Actions tab -> "Render tour panos (parallel)" -> Run workflow.
+
+name: Render tour panos (parallel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Which panos: all 13 walk-in nodes, the 6 room centres, or one pano'
+        type: choice
+        options: [all, rooms, single]
+        default: all
+      pano:
+        description: 'Single pano key (only when scope=single)'
+        type: string
+        default: living
+      payload_tag:
+        description: 'Release tag holding payload.zip on faisallatif2990-oss/blender-lane'
+        type: string
+        default: payload-20261125
+      scheme:
+        description: 'Colour scheme'
+        type: choice
+        options: [warm-luxury, fresh-light, bold]
+        default: warm-luxury
+
+permissions:
+  contents: read
+
+env:
+  BLENDER_VERSION: 5.3.0
+  BLENDER_URL: https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz
+  PAYLOAD_REPO: faisallatif2990-oss/blender-lane
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - name: Build pano matrix
+        id: build
+        run: |
+          case "${{ inputs.scope }}" in
+            all)   PANOS="living-entry living dining passage kitchen-door kitchen bath bed1-door bed1 bed2-door bed2 balcony-step balcony" ;;
+            rooms) PANOS="living bed1 bed2 kitchen bath balcony" ;;
+            single) PANOS="${{ inputs.pano }}" ;;
+          esac
+          # Validate every key against the 13 node keys the script knows
+          # (_node_defs in plan_to_render.py; --pano filters on these).
+          KNOWN=" living-entry living dining passage kitchen-door kitchen bath bed1-door bed1 bed2-door bed2 balcony-step balcony "
+          for p in $PANOS; do
+            case "$KNOWN" in *" $p "*) ;; *) echo "::error::unknown pano key: $p"; exit 1;; esac
+          done
+          JSON=$(printf '%s\n' $PANOS | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))")
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+          echo "panos: $JSON"
+
+  render:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        pano: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install Blender headless dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxi6 libxrender1 libxrandr2 libxxf86vm1 libxinerama1 libxcursor1 libgl1 libsm6
+
+      - name: Download Blender 5.3.0 (official tarball)
+        run: |
+          curl -fsSL "$BLENDER_URL" -o blender.tar.xz
+          mkdir -p "$HOME/blender"
+          tar -xf blender.tar.xz -C "$HOME/blender" --strip-components=1
+          echo "$HOME/blender" >> "$GITHUB_PATH"
+          blender --version
+
+      - name: Download payload (release asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.payload_tag }}" \
+            --repo "$PAYLOAD_REPO" --pattern 'payload.zip' --dir .
+          unzip -q payload.zip -d payload
+          # The released payload carries the GPU-patched script
+          # (cy.device = 'GPU', built for the Kaggle lane). This lane
+          # is CPU-only: restore the CPU line before rendering.
+          sed -i "s/cy.device = 'GPU'/cy.device = 'CPU'/" payload/code-pipeline/plan_to_render.py
+          grep -n "cy.device" payload/code-pipeline/plan_to_render.py
+          ls payload/sample-2bhk-plan.json payload/blender-proof/textures | head -5
+
+      - name: Render pano ${{ matrix.pano }}
+        working-directory: payload/code-pipeline
+        run: |
+          set -o pipefail
+          blender -b --python plan_to_render.py -- \
+            ../sample-2bhk-plan.json preview unused.png \
+            --view tour --pano "${{ matrix.pano }}" \
+            --scheme "${{ inputs.scheme }}" 2>&1 | tee "render-${{ matrix.pano }}.log"
+          test -s "tour/pano-${{ matrix.pano }}.jpg"
+
+      - name: Facing-gate check (cheap — runs inside the script)
+        working-directory: payload/code-pipeline
+        run: |
+          LOG="render-${{ matrix.pano }}.log"
+          grep -q '\[facing\] GATE SUMMARY' "$LOG" || { echo '::error::no facing-gate summary in render log'; exit 1; }
+          SUMMARY=$(grep '\[facing\] GATE SUMMARY' "$LOG")
+          echo "$SUMMARY"
+          echo "$SUMMARY" | grep -q ', 0 FAIL' || { echo "::error::facing gate FAILED: $SUMMARY"; exit 1; }
+          # Placement gates ([gates] lines) are REPORTED, not fatal:
+          # no measured baseline exists for them on the sample plan yet,
+          # and a human still eyeballs every pano before it ships.
+          grep '\[gates\]' "$LOG" || echo 'no [gates] lines in log'
+
+      - name: Upload pano artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pano-${{ matrix.pano }}
+          path: |
+            payload/code-pipeline/tour/pano-${{ matrix.pano }}.jpg
+            payload/code-pipeline/render-${{ matrix.pano }}.log
+          retention-days: 30
+          if-no-files-found: error
+
+  report:
+    needs: render
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: How to pull the panos back
+        run: |
+          echo "Download all pano artifacts into the local tour/ folder:"
+          echo "  gh run download <RUN_ID> --repo $PAYLOAD_REPO -D code-pipeline/tour"
+          echo "Artifacts land in per-pano subfolders; flatten with:"
+          echo "  cd code-pipeline/tour && for d in pano-*/; do mv \"\$d\"*.jpg .; done"
+          echo "Then EYEBALL every pano flat (standing QA rule) before it counts as delivered."
