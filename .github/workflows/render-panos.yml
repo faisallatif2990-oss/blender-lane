@@ -137,7 +137,7 @@ jobs:
           mkdir -p "$HOME/blender"
           tar -xf blender.tar.xz -C "$HOME/blender" --strip-components=1
           echo "$HOME/blender" >> "$GITHUB_PATH"
-          blender --version
+          "$HOME/blender/blender" --version
 
       - name: Download payload (release asset)
         env:
